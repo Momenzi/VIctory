@@ -219,29 +219,73 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+const DEFAULT_LOW_VRAM_MODE: (u32, u32) = (1920, 1080);
+const DEFAULT_HIGH_VRAM_MODE: (u32, u32) = (3840, 2160);
+
+#[cfg(windows)]
+fn low_vram_host() -> bool {
+    crate::host::host().is_some_and(crate::host::Host::is_low_vram)
+}
+
+#[cfg(not(windows))]
+fn low_vram_host() -> bool {
+    false
+}
+
+fn parse_display_size(value: &str) -> Option<(u32, u32)> {
+    let trimmed = value.trim();
+    let size = if trimmed.eq_ignore_ascii_case("720p") {
+        (1280, 720)
+    } else if trimmed.eq_ignore_ascii_case("900p") {
+        (1600, 900)
+    } else if trimmed.eq_ignore_ascii_case("1080p") {
+        (1920, 1080)
+    } else if trimmed.eq_ignore_ascii_case("1440p") {
+        (2560, 1440)
+    } else if trimmed.eq_ignore_ascii_case("2160p") || trimmed.eq_ignore_ascii_case("4k") {
+        (3840, 2160)
+    } else {
+        let (w, h) = trimmed.split_once(['x', 'X'])?;
+        (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)
+    };
+    ((640..=7680).contains(&size.0) && (360..=4320).contains(&size.1)).then_some(size)
+}
+
+fn resolve_display_size(
+    resolution_env: Option<&str>,
+    display_mode_env: Option<&str>,
+    low_vram: bool,
+) -> (u32, u32) {
+    resolution_env
+        .and_then(parse_display_size)
+        .or_else(|| display_mode_env.and_then(parse_display_size))
+        .unwrap_or(if low_vram {
+            DEFAULT_LOW_VRAM_MODE
+        } else {
+            DEFAULT_HIGH_VRAM_MODE
+        })
+}
+
+/// The size of the display the console reports: `VICTORY_RESOLUTION` (or
+/// `VICTORY_DISPLAY_MODE`) if set (`WxH`, or `720p`/`900p`/`1080p`/`1440p`/`4k`),
+/// else `1920x1080` on `<= 8 GiB` dedicated VRAM GPUs and `3840x2160` on larger
+/// cards.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let resolution = std::env::var("VICTORY_RESOLUTION").ok();
+        let display_mode = std::env::var("VICTORY_DISPLAY_MODE").ok();
+        let size = resolve_display_size(
+            resolution.as_deref(),
+            display_mode.as_deref(),
+            low_vram_host(),
+        );
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
+/// The console's mode list: one progressive mode at 60 Hz (`display_size()`).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
@@ -337,5 +381,34 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn display_mode_defaults_and_overrides() {
+        assert_eq!(resolve_display_size(None, None, true), (1920, 1080));
+        assert_eq!(resolve_display_size(None, None, false), (3840, 2160));
+
+        assert_eq!(resolve_display_size(Some("720p"), None, true), (1280, 720));
+        assert_eq!(resolve_display_size(Some("900p"), None, false), (1600, 900));
+        assert_eq!(resolve_display_size(Some("1080p"), None, false), (1920, 1080));
+        assert_eq!(resolve_display_size(Some("1440p"), None, true), (2560, 1440));
+        assert_eq!(resolve_display_size(Some("4k"), None, true), (3840, 2160));
+        assert_eq!(resolve_display_size(Some("2160p"), None, true), (3840, 2160));
+        assert_eq!(
+            resolve_display_size(Some(" 1280 X 720 "), Some("3840x2160"), false),
+            (1280, 720)
+        );
+        assert_eq!(
+            resolve_display_size(None, Some("2560x1440"), true),
+            (2560, 1440)
+        );
+        assert_eq!(
+            resolve_display_size(Some("invalid"), Some("1280x720"), false),
+            (1280, 720)
+        );
+        assert_eq!(
+            resolve_display_size(Some("320x240"), Some("9999x9999"), true),
+            (1920, 1080)
+        );
     }
 }
