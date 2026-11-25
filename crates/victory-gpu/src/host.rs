@@ -1696,14 +1696,14 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (`VICTORY_CARD_REHASH_RUNS=1`; on by default, `=0` disables), and
+/// not in a pass per range sent up.
 ///
 /// Each upload refreshes the fingerprints before any title lists execute.
 /// Joining adjacent ranges reduces the number of dispatches for the same pieces.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1713,16 +1713,16 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 static CARD_FETCH_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; on by
+/// default, `=0` disables). The pieces the card's compare found differing
+/// come down in one fetch and were then merged one after the other on the thread that
 /// settles: about 630 pieces and 40 MB a frame (run 104), each compared
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2106,9 +2106,26 @@ pub(crate) fn copy_fetch_runs<'a>(
     CARD_FETCH_COPIES.fetch_add(copies, Ordering::Relaxed);
 }
 
+/// Coalesces overlapping and touching dirty ranges per buffer into packed
+/// readback pieces `(buffer, lo, hi, offset)` and returns the total bytes.
+fn coalesce_relay_pieces<T: Clone>(
+    grouped: Vec<(T, Vec<(usize, usize)>)>,
+) -> (Vec<(T, usize, usize, u64)>, u64) {
+    let mut pieces = Vec::new();
+    let mut total = 0u64;
+    for (buffer, mut spans) in grouped {
+        join_ranges(&mut spans, std::iter::empty());
+        for (lo, hi) in spans {
+            pieces.push((buffer.clone(), lo, hi, total));
+            total += (hi - lo) as u64;
+        }
+    }
+    (pieces, total)
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{coalesce_relay_pieces, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2144,6 +2161,25 @@ mod relay_tests {
         assert!(!fetch.contains_key(&(b, 3)));
         assert_eq!(fetch.get(&(b, 9)), Some(&u16::MAX));
         assert_eq!(fetch.len(), 2);
+    }
+
+    #[test]
+    fn relay_pieces_coalesce_overlapping_and_touching_ranges() {
+        let grouped = vec![
+            ("buf_a", vec![(8192, 16384), (0, 4096), (4096, 12288), (24576, 28672)]),
+            ("buf_b", vec![(4096, 8192), (0, 4096)]),
+            ("empty", Vec::new()),
+        ];
+        let (pieces, total) = coalesce_relay_pieces(grouped);
+        assert_eq!(
+            pieces,
+            vec![
+                ("buf_a", 0, 16384, 0),
+                ("buf_a", 24576, 28672, 16384),
+                ("buf_b", 0, 8192, 20480),
+            ]
+        );
+        assert_eq!(total, 28672);
     }
 }
 
@@ -3857,14 +3893,14 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
-        if let Some((differs, dwords)) = differs {
+        let (pieces, total) = if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+                Vec::new();
+            let mut by_copy = std::collections::HashMap::new();
             for plan in plans {
                 let fetched = flagged_pieces(plan.ranges.iter().flat_map(|r| {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
@@ -3876,17 +3912,19 @@ impl Host {
                         let Some(&mask) = fetched.get(&(copy, r.span.first + p)) else {
                             continue;
                         };
-                        for (lo, hi) in r.span.changed_ranges(p, mask) {
-                            if seen.insert((copy, lo, hi)) {
-                                pieces.push((r.shadow.clone(), lo, hi, total));
-                                total += (hi - lo) as u64;
-                            }
-                        }
+                        let at = *by_copy.entry(copy).or_insert_with(|| {
+                            grouped.push((r.shadow.clone(), Vec::new()));
+                            grouped.len() - 1
+                        });
+                        grouped[at].1.extend(r.span.changed_ranges(p, mask));
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
-        }
+            coalesce_relay_pieces(grouped)
+        } else {
+            (Vec::new(), 0)
+        };
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -6157,7 +6195,7 @@ mod fill_tests {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; on by default, `=0` disables).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -6170,7 +6208,7 @@ mod fill_tests {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

@@ -21,10 +21,16 @@ For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --loc
 
 ### Performance defaults
 
-- **CPU parallelism:** `VICTORY_FILL_WORKERS` automatically scales to `4–6` workers based on logical CPU cores (override with `VICTORY_FILL_WORKERS=1`), and `VICTORY_PARALLEL_PRELUDES` defaults to on (`VICTORY_PARALLEL_PRELUDES=0` disables it).
+- **CPU parallelism:** `VICTORY_FILL_WORKERS` automatically scales to `4–6` workers based on logical CPU cores (override with `VICTORY_FILL_WORKERS=1`), and `VICTORY_PARALLEL_PRELUDES`, `VICTORY_WIDE_REFRESH`, and `VICTORY_WIDE_MERGE` all default to on (`=0` disables each) so prelude recording, host-copy refreshes, and card readback merges run across the worker pool.
+- **Shader & indirect-draw batching:** `VICTORY_RT_RESOLVE` defaults off whenever `VICTORY_BVH_BUILDER` is off (skipping ~1,000 unused ray-tracing resolve compute compiles on world entry; `VICTORY_RT_RESOLVE=1` opts back in and `--rt` enables both), `VICTORY_INDIRECT_WINDOW` defaults to on (clamping sequential indirect mesh records in windows of up to 64 instead of per-draw compute barriers; `=0` disables), and `VICTORY_CARD_REHASH_RUNS` defaults to on (joining adjacent piece rehash passes; `=0` disables) alongside multi-flight dirty-span coalescing in `relay_card_back`.
 - **8 GB VRAM auto-tuning:** When DXGI reports `<= 8 GiB` dedicated VRAM, `VICTORY_CARD_BUFFERS_MB` defaults to `512` and `VICTORY_TEXTURE_ROOM_PERCENT` defaults to `94` (up from `90`) to avoid spilling textures across PCIe.
 - **Per-descriptor UAV readback filtering:** Descriptor-table UAVs that a shader only reads (`BufferLoad`, `RawBufferLoad`, `TextureLoad`, `GetDimensions`) are excluded from post-submit GPU->CPU snapshot/hash readbacks.
 - **In-place memory safety:** `VirtualFree` and `VirtualProtect` hooks evict overlapping `VICTORY_INPLACE=1` heaps and drain retired GPU resources before releasing or protecting pages.
+
+#### Remaining sync & readback bottlenecks
+
+- **`WHY_READ` settles (`a fill of upload memory` / `a buffer copy`):** CPU upload fills (unaligned `<256 B` root CBVs, fresh descriptor-table CBVs, and `CopyTextureRegion` footprint staging) and title buffer copies wait in `relay_wait(WHY_READ)` whenever their source range overlaps broad GPU-written spans declared in `line.written.buffers` (such as the shared 174 MB heap). Eliminating these safely requires shader-bound write inference or GPU-side CBV copies rather than truncating `VICTORY_ROOT_UAV_MB`.
+- **`relay_card_back` queue head-of-line stalls:** Fetching dirty card-copy pieces submits a small readback command list onto the single FIFO `DIRECT` queue (`self.queue`), where it can stall behind newer queued rendering flights before earlier flights can land. Moving it off-queue safely requires double-buffered/inline readback synchronization rather than an unsynchronized D3D12 `COPY` queue.
 
 ## Try experimental ray tracing on Radeon
 
@@ -57,11 +63,12 @@ The source ZIP builds with the Windows setup script. The test report covers shad
 
 ### Testing CPU submission workers
 
-For a local experiment, open PowerShell and run the following after setup. The process uses four CPU workers for eligible upload batches and can record independent transition command lists on the shared worker pool. The final GPU queue, fence signals and resource transitions retain the game's submission order. Compare the same save and camera after the initial streaming period. The default launcher uses the baseline settings.
+For a local baseline comparison, open PowerShell and override the promoted parallel defaults (`VICTORY_FILL_WORKERS=4–6` and `VICTORY_PARALLEL_PRELUDES=1` / `VICTORY_WIDE_REFRESH=1` are already enabled by default). The final GPU queue, fence signals and resource transitions retain the game's submission order. Compare the same save and camera after the initial streaming period.
 
 ```powershell
-$env:VICTORY_FILL_WORKERS = '4'
-$env:VICTORY_PARALLEL_PRELUDES = '1'
+$env:VICTORY_FILL_WORKERS = '1'
+$env:VICTORY_PARALLEL_PRELUDES = '0'
+$env:VICTORY_WIDE_REFRESH = '0'
 & "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe"
 ```
 

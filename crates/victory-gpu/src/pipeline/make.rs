@@ -82,16 +82,18 @@ fn too_dear(shaders: &[Arc<Shader>]) -> bool {
 /// were hit by: about 1,000 compute programs of the title
 /// (`CS_RaytracingResolve`, the `raytracingresolve_dispatch` pass of each
 /// material), all bound at the world's first frame, each 5 to 9 s of AMD's
-/// compiler. They stood in the queue before the passes that make the
-/// picture, and with the structure builder off there is no hit to shade.
-/// Made by default, the picture before loading time (with the builder on
-/// they shade what reflections and indirect light hit);
-/// `VICTORY_RT_RESOLVE=0` leaves them out while the builder is off.
+/// compiler. Left out by default while `VICTORY_BVH_BUILDER` is off since
+/// there is no hit to shade (`VICTORY_RT_RESOLVE=1` opts back in; with the
+/// builder on they shade what reflections and indirect light hit).
+fn rt_resolve_excluded(builder: bool, rt_resolve: Option<&str>) -> bool {
+    !builder && !matches!(rt_resolve.map(str::trim), Some("1"))
+}
+
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
     let out = *OUT.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
+        rt_resolve_excluded(builder, std::env::var("VICTORY_RT_RESOLVE").ok().as_deref())
     });
     out && named(shaders, b"CS_RaytracingResolve")
 }
@@ -600,7 +602,10 @@ fn drained() {
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long, sharing_from};
+    use super::{
+        FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long,
+        rt_resolve_excluded, sharing_from,
+    };
     use std::time::{Duration, Instant};
 
     /// Two threads ask for pipelines still being made in one frame, the
@@ -681,6 +686,17 @@ mod loading_tests {
         let between = Duration::from_secs(5);
         assert!(held_too_long(Duration::from_secs(60), true, between));
         assert!(!held_too_long(Duration::from_secs(60), false, between));
+    }
+
+    #[test]
+    fn rt_resolve_skips_by_default_without_builder() {
+        assert!(rt_resolve_excluded(false, None));
+        assert!(rt_resolve_excluded(false, Some("0")));
+        assert!(!rt_resolve_excluded(false, Some("1")));
+        assert!(!rt_resolve_excluded(false, Some(" 1 ")));
+        assert!(!rt_resolve_excluded(true, None));
+        assert!(!rt_resolve_excluded(true, Some("0")));
+        assert!(!rt_resolve_excluded(true, Some("1")));
     }
 }
 
