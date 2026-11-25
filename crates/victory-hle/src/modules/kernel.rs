@@ -332,6 +332,24 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// Releases any in-place D3D12 heaps overlapping `[address, address + size)`
+/// before forwarding `VirtualFree` to Windows so the kernel does not reject the
+/// call with `ERROR_INVALID_PARAMETER` (87).
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+    host::virtual_free(address, size, free_type)
+}
+
+/// Releases any in-place D3D12 heaps overlapping `[address, address + size)`
+/// before changing page protections away from read-write.
+pub extern "system" fn VirtualProtect(
+    address: *mut c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    host::virtual_protect(address, size, new_protect, old_protect)
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -404,6 +422,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -421,6 +440,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(GetProcAddress),
             hle_export!(FreeLibrary),
             hle_export!(DisableThreadLibraryCalls),
+            hle_export!(VirtualFree),
+            hle_export!(VirtualProtect),
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
@@ -450,6 +471,12 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
+    use windows_sys::Win32::System::Memory::{
+        MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEMORY_BASIC_INFORMATION,
+        PAGE_READWRITE, VirtualFree as os_virtual_free, VirtualProtect as os_virtual_protect,
+        VirtualQuery,
+    };
+    use windows_sys::Win32::System::SystemServices::MEM_COALESCE_PLACEHOLDERS;
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
     unsafe extern "C" {
@@ -537,6 +564,74 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    fn allocation_span(address: *const c_void) -> usize {
+        let mut len = 0usize;
+        let mut cursor = address as usize;
+        let mut base = None;
+        loop {
+            // SAFETY: plain out structure filled by VirtualQuery.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            let n = unsafe {
+                VirtualQuery(
+                    cursor as *const c_void,
+                    &mut info,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if n == 0 || info.RegionSize == 0 {
+                break;
+            }
+            let alloc_base = info.AllocationBase as usize;
+            if *base.get_or_insert(alloc_base) != alloc_base {
+                break;
+            }
+            let end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            len = end.saturating_sub(address as usize);
+            if end <= cursor {
+                break;
+            }
+            cursor = end;
+        }
+        len
+    }
+
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+        if !address.is_null()
+            && victory_gpu::has_in_place()
+            && (free_type & (MEM_DECOMMIT | MEM_RELEASE)) != 0
+            && (free_type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS)) == 0
+        {
+            let len = if size > 0 {
+                size
+            } else {
+                allocation_span(address)
+            };
+            if len > 0 {
+                victory_gpu::title_memory_freeing(address as usize, len);
+            }
+        }
+        // SAFETY: forwarding the title's arguments after evicting any blocking heaps.
+        unsafe { os_virtual_free(address, size, free_type) }
+    }
+
+    pub(super) fn virtual_protect(
+        address: *mut c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32 {
+        if !address.is_null()
+            && size > 0
+            && new_protect != PAGE_READWRITE
+            && victory_gpu::has_in_place()
+        {
+            victory_gpu::title_memory_freeing(address as usize, size);
+        }
+        // SAFETY: forwarding the title's arguments after evicting any blocking heaps.
+        unsafe { os_virtual_protect(address, size, new_protect, old_protect) }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
@@ -636,6 +731,14 @@ mod host {
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
+    }
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_protect(_: *mut c_void, _: usize, _: u32, _: *mut u32) -> i32 {
+        0
     }
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
@@ -809,5 +912,32 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn virtual_memory_hooks_are_exported_and_forward_safely() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        };
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert!(!kernel32.is_null());
+        assert_eq!(
+            GetProcAddress(kernel32, c"VirtualFree".as_ptr().cast()) as usize,
+            crate::registry::lookup("kernel32.dll", "VirtualFree").unwrap()
+        );
+        assert_eq!(
+            GetProcAddress(kernel32, c"VirtualProtect".as_ptr().cast()) as usize,
+            crate::registry::lookup("kernel32.dll", "VirtualProtect").unwrap()
+        );
+        // SAFETY: test-owned private allocation.
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!mem.is_null());
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(mem, 4096, PAGE_READONLY, &mut old), 0);
+            assert_eq!(old, PAGE_READWRITE);
+            assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+        }
     }
 }

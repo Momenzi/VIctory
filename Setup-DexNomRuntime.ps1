@@ -2,7 +2,8 @@
 param(
     [string] $GamePath,
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'DexNom Runtime'),
-    [string] $ShortcutDirectory = [Environment]::GetFolderPath('Programs')
+    [string] $ShortcutDirectory = [Environment]::GetFolderPath('Programs'),
+    [Alias('DebugBuild')] [switch] $Diagnostics
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,7 +48,11 @@ try {
     & (Join-Path $PSScriptRoot 'Initialize-FormatTables.ps1')
     $targetDir = Join-Path $PSScriptRoot 'target'
     $target = 'x86_64-pc-windows-msvc'
-    & cargo build --locked --release -p victory --features diagnostics --bins --target $target --target-dir $targetDir
+    $cargoArgs = @('build', '--locked', '--release', '-p', 'victory', '--bins', '--target', $target, '--target-dir', $targetDir)
+    if ($Diagnostics) {
+        $cargoArgs += @('--features', 'diagnostics')
+    }
+    & cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) {
         throw 'Build failed. Check the compiler output and the C++ workload and Windows SDK listed in the README.'
     }

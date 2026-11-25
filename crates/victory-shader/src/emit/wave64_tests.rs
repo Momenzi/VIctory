@@ -130,6 +130,8 @@ fn lowered_for_dispatch(native: &NativeProgram, p: &ir::Program, wide: &HashSet<
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         written_root_uavs: lowered.written_root_uavs,
+        written_table_uavs: lowered.written_table_uavs,
+        writes_untracked_uav: lowered.writes_untracked_uav,
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     })

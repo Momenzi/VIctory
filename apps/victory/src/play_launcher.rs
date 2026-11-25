@@ -13,12 +13,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let (mut warp, mut rt) = (false, false);
+    let (mut warp, mut rt, mut diagnostics) = (false, false, false);
     while let Some(option) = args.peek() {
         if option == "--warp" {
             warp = true;
         } else if option == "--rt" {
             rt = true;
+        } else if option == "--diagnostics" || option == "--debug" {
+            diagnostics = true;
         } else {
             break;
         }
@@ -34,7 +36,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--rt] [--warp] [game executable]", launcher.display());
+        bail!(
+            "Usage\n{} [--rt] [--diagnostics|--debug] [--warp] [game executable]",
+            launcher.display()
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    if warp {
+        bail!("--warp requires a diagnostics build (re-run Setup.cmd -Diagnostics)");
     }
     if !game.is_file() || !runtime.is_file() {
         bail!(
@@ -92,7 +101,10 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         child.env("VICTORY_D3D12_WARP", "1");
     }
     if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
-        child.env("VICTORY_DEBUG_HUD", "1");
+        child.env("VICTORY_DEBUG_HUD", if diagnostics { "1" } else { "0" });
+    }
+    if diagnostics {
+        writeln!(log, "Diagnostics HUD requested")?;
     }
     child
         .current_dir(folder)

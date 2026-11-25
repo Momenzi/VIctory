@@ -942,9 +942,14 @@ fn record_preludes(plans: Vec<PlannedPrelude>) {
 
 /// Single-list and repeated-list submissions use inline recording. A list
 /// owns one prelude allocator, so it cannot be reset by two workers.
+/// On by default; `VICTORY_PARALLEL_PRELUDES=0` forces inline recording.
 fn parallel_preludes(runs: &[&HostList]) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if runs.len() < 4 || !*ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_PRELUDES").is_some_and(|v| v == "1")) {
+    if runs.len() < 4
+        || !*ON.get_or_init(|| {
+            std::env::var_os("VICTORY_PARALLEL_PRELUDES").is_none_or(|v| v != "0")
+        })
+    {
         return false;
     }
     let mut unique = std::collections::HashSet::with_capacity(runs.len());
@@ -2600,6 +2605,18 @@ pub(crate) fn settle_for_present() {
 }
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
+}
+
+/// Settles any flights in the air and synchronously drops retired host objects
+/// (such as `ID3D12Heap`s backing in-place allocations about to be freed).
+pub(crate) fn drain_retired() {
+    if late() {
+        settle_now(WHY_SYNC);
+    } else if let Some(host) = host() {
+        // Ensure any synchronous submission currently in flight has finished.
+        let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    }
+    bury(FINISHED.load(Ordering::Acquire));
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -5923,14 +5940,24 @@ impl HostList {
     }
 }
 
+fn default_fill_workers(logical: usize) -> usize {
+    (logical / 2).clamp(4, 6).min(logical).clamp(1, 6)
+}
+
 /// Worker count for independent runs of upload fills at submission.
+/// Defaults to 4..=6 workers based on available CPU parallelism (capped by
+/// logical cores); `VICTORY_FILL_WORKERS=1` forces serial upload fills.
 fn fill_workers() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
         std::env::var("VICTORY_FILL_WORKERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or_else(|| {
+                let logical = std::thread::available_parallelism()
+                    .map_or(4, std::num::NonZeroUsize::get);
+                default_fill_workers(logical)
+            })
             .clamp(1, 6)
     })
 }
@@ -6114,6 +6141,18 @@ mod fill_tests {
         }
         list.reset();
         assert!(list.deferred().copies.is_empty());
+    }
+
+    #[test]
+    fn default_fill_workers_scales_with_logical_cores() {
+        assert_eq!(default_fill_workers(1), 1);
+        assert_eq!(default_fill_workers(2), 2);
+        assert_eq!(default_fill_workers(4), 4);
+        assert_eq!(default_fill_workers(6), 4);
+        assert_eq!(default_fill_workers(8), 4);
+        assert_eq!(default_fill_workers(12), 6);
+        assert_eq!(default_fill_workers(16), 6);
+        assert_eq!(default_fill_workers(32), 6);
     }
 }
 
@@ -7247,6 +7286,37 @@ impl Host {
             self.log_video_memory("right after that change");
         }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Whether the hardware adapter has <= 8 GiB of dedicated VRAM (or a local
+    /// DXGI memory budget <= 8 GiB). Returns `false` for software adapters or
+    /// when DXGI memory info is unavailable.
+    pub(crate) fn is_low_vram(&self) -> bool {
+        const EIGHT_GIB: u64 = 8 << 30;
+        let Some(adapter) = self.adapter.as_ref() else {
+            return false;
+        };
+        // SAFETY: plain DXGI adapter descriptor query.
+        let desc = adapter
+            .cast::<IDXGIAdapter1>()
+            .ok()
+            .and_then(|a| unsafe { a.GetDesc1().ok() });
+        if let Some(desc) = desc {
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                return false;
+            }
+            if desc.DedicatedVideoMemory > 0 {
+                return (desc.DedicatedVideoMemory as u64) <= EIGHT_GIB;
+            }
+        }
+        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: plain DXGI local memory budget query.
+        let ok = unsafe {
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+                .is_ok()
+        };
+        ok && own.Budget > 0 && own.Budget <= EIGHT_GIB
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

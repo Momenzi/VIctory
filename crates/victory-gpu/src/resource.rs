@@ -1400,7 +1400,8 @@ pub(crate) fn room() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
+/// textures picked by index are made ([`room`]): 94 on <= 8 GiB VRAM GPUs
+/// and 90 on larger GPUs, unless
 /// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
 /// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
 /// textures wait (runs 170-174); the card copies of title buffers from
@@ -1410,10 +1411,15 @@ pub(crate) fn room() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
+        let default_percent = if crate::host::host().is_some_and(crate::host::Host::is_low_vram) {
+            94
+        } else {
+            90
+        };
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(default_percent, |percent| percent.clamp(50, 97))
     })
 }
 

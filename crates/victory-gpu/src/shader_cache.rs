@@ -168,7 +168,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH3";
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -247,6 +247,12 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.written_table_uavs.len() as u32);
+    for &(slot, dword) in &s.written_table_uavs {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
+    word(&mut out, u32::from(s.writes_untracked_uav));
     word(&mut out, u32::from(s.writes_guest_memory));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
@@ -318,6 +324,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let written_root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut written_table_uavs = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        written_table_uavs.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
+    let writes_untracked_uav = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let writes_guest_memory = match r.word()? {
         0 => false,
         1 => true,
@@ -344,6 +360,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         written_root_uavs,
+        written_table_uavs,
+        writes_untracked_uav,
         writes_guest_memory,
         root_indexed_views,
     })
@@ -374,6 +392,8 @@ mod tests {
             root_srvs: vec![0, 3],
             root_uavs: vec![1, 2],
             written_root_uavs: vec![2],
+            written_table_uavs: vec![(1, 8)],
+            writes_untracked_uav: false,
             writes_guest_memory: true,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
@@ -437,8 +457,11 @@ mod tests {
         let mut read_only = shader();
         read_only.writes_guest_memory = false;
         assert_eq!(decode(&encode(&read_only)), Some(read_only));
+        let mut untracked = shader();
+        untracked.writes_untracked_uav = true;
+        assert_eq!(decode(&encode(&untracked)), Some(untracked));
         let mut stale = bytes.clone();
-        stale[..4].copy_from_slice(b"VSH2");
+        stale[..4].copy_from_slice(b"VSH3");
         assert_eq!(decode(&stale), None);
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);

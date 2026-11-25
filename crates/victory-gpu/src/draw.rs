@@ -113,9 +113,6 @@ thread_local! {
     /// and whether a view its shaders read is of that same texture.
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
-    /// While a stage's tables are walked (`State::tables`): whether that
-    /// stage's shader can store to buffers (`Translated::stores`).
-    static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1157,16 +1154,26 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
-            STORES.set(true);
+            // What the shader stores through tables, root views and raw
+            // addresses is copied back into title memory afterwards.
+            let publish = !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let table_writes = TableWrites {
+                publish,
+                stores: t.stores,
+                written: &t.host.written_table_uavs,
+                untracked: t.host.writes_untracked_uav,
+            };
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                compute,
+                table_writes,
+            );
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
-            // What the shader stores through root views and raw addresses is
-            // copied back into title memory afterwards.
-            let publish = !crate::pipeline::builder_quarantined(self.pipeline as This);
             let writes = publish && (t.stores || !write_skip());
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
@@ -2103,7 +2110,7 @@ impl State {
                 crate::texture::upload_again(resource);
             }
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, false);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2737,7 +2744,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, writes: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2749,7 +2756,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, writes);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2774,6 +2781,7 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        table_writes: TableWrites<'_>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
@@ -2807,7 +2815,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, table_writes.entry(u));
             }
         }
         let mut made = Vec::new();
@@ -2882,7 +2890,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, table_writes.entry(u));
                     }
                 }
                 for k in selected {
@@ -2893,7 +2901,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, table_writes.selected());
                     }
                 }
                 made.push((slot, first * 32));
@@ -2928,11 +2936,15 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        let kind = used.map(|u| u.kind).or_else(|| {
-                            selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
-                        });
+                        let (kind, writes) = match used {
+                            Some(u) => (Some(u.kind), table_writes.entry(u)),
+                            None => (
+                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view)),
+                                table_writes.selected(),
+                            ),
+                        };
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, writes);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3591,7 +3603,35 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+#[derive(Clone, Copy)]
+pub(crate) struct TableWrites<'a> {
+    publish: bool,
+    stores: bool,
+    written: &'a [(u8, u32)],
+    untracked: bool,
+}
+
+impl TableWrites<'_> {
+    fn entry(&self, u: &UsedResource) -> bool {
+        if !self.publish {
+            false
+        } else if !write_skip() {
+            true
+        } else if !self.stores {
+            false
+        } else if self.untracked {
+            true
+        } else {
+            self.written.contains(&(u.slot, u.table_offset_dwords))
+        }
+    }
+
+    fn selected(&self) -> bool {
+        self.publish && (!write_skip() || (self.stores && self.untracked))
+    }
+}
+
+fn readable(list: &HostList, kind: ResourceType, view: &View, writes: bool) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().map_or(view, |p| &p.view);
@@ -3600,9 +3640,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            // A shader or descriptor that cannot store to buffers leaves the
+            // range as the title has it: nothing to find afterwards.
+            if writes {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
@@ -4118,7 +4158,7 @@ mod tests {
             let list = host.new_list().unwrap();
             heap.mirror(0, handle, true).unwrap();
             heap.make_at(1, &reader);
-            readable(&list, ResourceType::Uav, &writer);
+            readable(&list, ResourceType::Uav, &writer, true);
             unsafe {
                 list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
                 list.list.SetComputeRootSignature(&write_root);
@@ -4127,7 +4167,7 @@ mod tests {
                     .SetComputeRootDescriptorTable(0, heap.gpu_handle(0));
                 list.list.Dispatch(1, 1, 1);
             }
-            readable(&list, ResourceType::Srv, &reader);
+            readable(&list, ResourceType::Srv, &reader, false);
             unsafe {
                 list.list.SetComputeRootSignature(&read_root);
                 list.list.SetPipelineState(&read_pso);

@@ -283,6 +283,11 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Subset of root UAV slots through which this shader may write.
     pub written_root_uavs: Vec<u8>,
+    /// Subset of static descriptor-table UAVs `(slot, table_offset_dwords)`
+    /// through which this shader may write.
+    pub written_table_uavs: Vec<(u8, u32)>,
+    /// Whether this shader may write through dynamic/untracked heap UAVs.
+    pub writes_untracked_uav: bool,
     /// A translated store or atomic can write through the guest page directory.
     pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
@@ -737,6 +742,8 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         written_root_uavs: l.written_root_uavs,
+        written_table_uavs: l.written_table_uavs,
+        writes_untracked_uav: l.writes_untracked_uav,
         writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
@@ -1175,6 +1182,8 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             written_root_uavs: Vec::new(),
+            written_table_uavs: Vec::new(),
+            writes_untracked_uav: false,
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
@@ -1189,6 +1198,8 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 written_root_uavs: Vec::new(),
+                written_table_uavs: Vec::new(),
+                writes_untracked_uav: false,
                 writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
@@ -1658,6 +1669,8 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
+                written_table_uavs: l.written_table_uavs,
+                writes_untracked_uav: l.writes_untracked_uav,
                 writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };

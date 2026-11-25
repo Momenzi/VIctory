@@ -173,6 +173,13 @@ pub(crate) struct Shader {
     pub root_uavs: Vec<(u8, V)>,
     /// Root UAV slots whose emitted operations may modify buffer contents.
     pub written_root_uavs: Vec<u8>,
+    /// Heap UAV handles created by `heap_handle`, paired with their static
+    /// `(table_slot, table_offset_dwords)` when proven, or `None` when dynamic.
+    pub heap_uavs: Vec<(V, Option<(u8, u32)>)>,
+    /// Static descriptor-table UAVs whose emitted operations may modify contents.
+    pub written_table_uavs: Vec<(u8, u32)>,
+    /// Whether any dynamic/untracked heap UAV handle performs a modifying op.
+    pub writes_untracked_uav: bool,
     /// A translated store or atomic can write through the guest page directory.
     pub writes_guest_memory: bool,
     pub flags: u64,
@@ -235,6 +242,55 @@ fn only_the_written_root_uavs_need_a_guest_writeback() {
     assert_eq!(s.written_root_uavs, [2, 3]);
 }
 
+#[cfg(test)]
+#[test]
+fn only_the_written_table_uavs_need_a_guest_writeback() {
+    let mut s = Shader::new(false);
+    let (idx0, idx1, idx2) = (s.m.i32(0), s.m.i32(1), s.m.i32(2));
+    let ro = s.heap_handle(s.entry, idx0, false, false, (11 | 0x1000, 0));
+    s.note_heap_uav(ro, Some((0, 0)));
+    let rw = s.heap_handle(s.entry, idx1, false, false, (11 | 0x1000, 0));
+    s.note_heap_uav(rw, Some((0, 8)));
+    let dyn_uav = s.heap_handle(s.entry, idx2, false, true, (11 | 0x1000, 0));
+    s.note_heap_uav(dyn_uav, None);
+
+    let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+    let undef = s.m.undef(s.t.i32);
+    for handle in [ro, rw, dyn_uav] {
+        s.op(
+            s.entry,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            139,
+            &[handle, zero, undef, mask, align],
+        );
+    }
+    assert!(s.written_table_uavs.is_empty());
+    assert!(!s.writes_untracked_uav);
+
+    s.op(
+        s.entry,
+        "rawBufferStore.i32",
+        Attr::NoUnwind,
+        s.t.void,
+        140,
+        &[rw, zero, undef, one, undef, undef, undef, mask, align],
+    );
+    assert_eq!(s.written_table_uavs, [(0, 8)]);
+    assert!(!s.writes_untracked_uav);
+
+    s.op(
+        s.entry,
+        "atomicBinOp.i32",
+        Attr::NoUnwind,
+        s.t.i32,
+        78,
+        &[dyn_uav, zero, zero, undef, undef, one],
+    );
+    assert!(s.writes_untracked_uav);
+}
+
 impl Shader {
     pub fn new(pixel: bool) -> Self {
         let mut m = Module::default();
@@ -279,6 +335,9 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             written_root_uavs: Vec::new(),
+            heap_uavs: Vec::new(),
+            written_table_uavs: Vec::new(),
+            writes_untracked_uav: false,
             writes_guest_memory: false,
             flags: 0,
             nonuniform_handles: 0,
@@ -303,6 +362,11 @@ impl Shader {
         g
     }
 
+    /// Records an annotated heap UAV handle and its static table location if known.
+    pub fn note_heap_uav(&mut self, handle: V, target: Option<(u8, u32)>) {
+        self.heap_uavs.push((handle, target));
+    }
+
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
         &mut self,
@@ -313,15 +377,26 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        // Raw root UAVs are also legal inputs. Only a read through a handle
-        // is known to leave it unchanged. Treat any other use of the handle
-        // conservatively, including atomics and future operations.
-        if !matches!(opcode, 68 | 72 | 139) // BufferLoad, GetDimensions, RawBufferLoad
+        // Raw root UAVs and descriptor-table UAVs are also legal inputs. Only
+        // read-only operations are known to leave contents unchanged. Treat any
+        // other use of the handle conservatively, including atomics.
+        if !matches!(opcode, 66 | 68 | 72 | 139 | 216) // TextureLoad, BufferLoad, GetDimensions, RawBufferLoad, AnnotateHandle
             && let Some(first) = args.first()
-            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
-            && !self.written_root_uavs.contains(&slot)
         {
-            self.written_root_uavs.push(slot);
+            if let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+                && !self.written_root_uavs.contains(&slot)
+            {
+                self.written_root_uavs.push(slot);
+            }
+            if let Some(&(_, target)) = self.heap_uavs.iter().find(|(h, _)| h == first) {
+                match target {
+                    Some(entry) if !self.written_table_uavs.contains(&entry) => {
+                        self.written_table_uavs.push(entry);
+                    }
+                    Some(_) => {}
+                    None => self.writes_untracked_uav = true,
+                }
+            }
         }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));

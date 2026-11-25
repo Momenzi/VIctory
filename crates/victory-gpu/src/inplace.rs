@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -119,8 +119,11 @@ pub(crate) struct Placed {
 /// with nothing if the memory is not private memory committed whole
 /// (nothing was asked of the host), with the host's error if it refused.
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let Some(end) = start.checked_add(len.max(1)) else {
+        return Err(None);
+    };
     let at = start & !(K64 as u64 - 1);
-    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let bytes = end.next_multiple_of(K64 as u64) - at;
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
@@ -138,6 +141,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    let host = crate::host::host()?;
+    static DEVICE13_OK: OnceLock<bool> = OnceLock::new();
+    if !*DEVICE13_OK.get_or_init(|| host.device.cast::<ID3D12Device13>().is_ok()) {
+        return None;
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -147,7 +155,6 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let host = crate::host::host()?;
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
@@ -175,18 +182,27 @@ pub(crate) fn gone(window: bool, bytes: u64) {
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
 }
 
+/// Whether any title memory is currently opened in place.
+pub fn has_in_place() -> bool {
+    STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) != 0
+}
+
 /// Title memory `[at, at + len)` is about to show something else, or the
 /// title is about to decommit, free or protect it: what is in place there
 /// is let go (the tables forget it; its heap goes when the last list and
-/// slot that hold it do). Called for memory the runtime maps anew; for
-/// the runtime to call before the title's own `VirtualFree` once it takes
-/// that call over.
+/// slot that hold it do). Called for memory the runtime maps anew and before
+/// the title's `VirtualFree` / `VirtualProtect`.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    if len == 0 || !has_in_place() {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
-    STATS[7].fetch_add(gone, Ordering::Relaxed);
+    if gone > 0 {
+        STATS[7].fetch_add(gone, Ordering::Relaxed);
+        if !crate::watch::is_changing() {
+            crate::host::drain_retired();
+        }
+    }
 }
 
 /// The line of what is in place, every ten seconds while [`level`] is on.
@@ -1255,7 +1271,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over

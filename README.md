@@ -17,7 +17,14 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 
 To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
-For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --bins` (add `--features diagnostics` or pass `-Diagnostics` to `Setup.cmd` for debug HUD, WARP, and frame-capture switches). The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe` (`--diagnostics` / `--debug` enables the desktop HUD when needed). Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+
+### Performance defaults
+
+- **CPU parallelism:** `VICTORY_FILL_WORKERS` automatically scales to `4–6` workers based on logical CPU cores (override with `VICTORY_FILL_WORKERS=1`), and `VICTORY_PARALLEL_PRELUDES` defaults to on (`VICTORY_PARALLEL_PRELUDES=0` disables it).
+- **8 GB VRAM auto-tuning:** When DXGI reports `<= 8 GiB` dedicated VRAM, `VICTORY_CARD_BUFFERS_MB` defaults to `512` and `VICTORY_TEXTURE_ROOM_PERCENT` defaults to `94` (up from `90`) to avoid spilling textures across PCIe.
+- **Per-descriptor UAV readback filtering:** Descriptor-table UAVs that a shader only reads (`BufferLoad`, `RawBufferLoad`, `TextureLoad`, `GetDimensions`) are excluded from post-submit GPU->CPU snapshot/hash readbacks.
+- **In-place memory safety:** `VirtualFree` and `VirtualProtect` hooks evict overlapping `VICTORY_INPLACE=1` heaps and drain retired GPU resources before releasing or protecting pages.
 
 ## Try experimental ray tracing on Radeon
 

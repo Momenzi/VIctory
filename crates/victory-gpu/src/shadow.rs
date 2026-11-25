@@ -142,7 +142,8 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (512 on
+/// <= 8 GiB VRAM GPUs, 1024 otherwise).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
@@ -151,11 +152,19 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
+        let default_cap_mb = if host().is_some_and(crate::host::Host::is_low_vram) {
+            512
+        } else {
+            1024
+        };
+        // From 1 MiB up and 1,024 MB in all by default (512 MB on <= 8 GiB VRAM
+        // GPUs): the shader writes of the smaller buffers are then found by
+        // the card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (
+            mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
+            mb("VICTORY_CARD_BUFFERS_MB", default_cap_mb),
+        )
     })
 }
 
@@ -1082,7 +1091,11 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // Caller thread also pulls jobs in `wide()`, so spawn up to 5 helpers
+        // (up to 6 concurrent threads total, matching `fill_workers`).
+        let n = std::thread::available_parallelism()
+            .map_or(3, |n| (n.get() / 2).saturating_sub(1))
+            .clamp(2, 5);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1777,21 +1790,38 @@ impl Shadow {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
     }
 
+    fn next_id() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
-        // Not a copy: not counted with them, and nothing asks what the
-        // title wrote there.
-        LIVE[0].fetch_sub(1, Ordering::Relaxed);
-        LIVE[1].fetch_sub(len, Ordering::Relaxed);
-        *shadow.watched.get_mut() = NOT_WATCHED;
-        shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
-        shadow
+        // Not a copy: not counted with `LIVE`, and allocates no per-page watch table.
+        Shadow {
+            buffer: placed.buffer,
+            data: start as *mut u8,
+            gpu: placed.gpu,
+            start,
+            len,
+            copied: Mutex::new(Vec::new()),
+            watched: AtomicU8::new(NOT_WATCHED),
+            pending: Mutex::default(),
+            flights: Mutex::default(),
+            before: Mutex::default(),
+            kept: Mutex::default(),
+            used: AtomicU64::new(crate::host::moment()),
+            asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
+            unsized_asks: AtomicU64::new(0),
+            id: Self::next_id(),
+            card: None,
+            window,
+            place: Some((placed.heap, placed.bias)),
+        }
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -1820,10 +1850,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id: Self::next_id(),
             card: None,
             window: false,
             place: None,
@@ -2914,21 +2941,23 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .range(..(end, 0))
+            .filter(|(key, shadow)| shadow.place.is_some() && key.0.saturating_add(key.1) > at)
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        for (_, entry) in map.range_mut(..(end, 0)).rev() {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
@@ -3375,6 +3404,54 @@ mod window_tests {
             let (start, len) = window_of(address, end, g);
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
+        }
+    }
+
+    #[test]
+    fn in_place_let_go_evicts_oversized_loose_windows_and_deeply_nested_buffers() {
+        use std::sync::Arc;
+        use windows::core::Interface;
+        let Some(device) = crate::inplace::tests::warp() else {
+            return;
+        };
+        if device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>().is_err() {
+            return;
+        }
+        const K64: usize = 64 << 10;
+        const SPAN: usize = 8 << 20;
+        unsafe {
+            let base = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                SPAN,
+                windows_sys::Win32::System::Memory::MEM_RESERVE
+                    | windows_sys::Win32::System::Memory::MEM_COMMIT,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!base.is_null());
+            let start = base as u64;
+            let placed = crate::inplace::place_part(&device, start, SPAN as u64).unwrap();
+            let shadow = Arc::new(super::Shadow::placed(placed, start, SPAN as u64, true));
+            {
+                let mut loose = super::LOOSE.lock().unwrap();
+                loose.insert((start, SPAN as u64), shadow.clone());
+            }
+            // Freeing the tail (> WINDOW past `start`) must still find and evict the 8 MiB window.
+            let tail = start + (6 << 20);
+            assert_eq!(super::in_place_let_go(tail, K64 as u64), 1);
+            assert!(
+                !super::LOOSE.lock().unwrap().contains_key(&(start, SPAN as u64)),
+                "oversized placed window should be evicted"
+            );
+            drop(shadow);
+            crate::host::drain_retired();
+            assert_ne!(
+                windows_sys::Win32::System::Memory::VirtualFree(
+                    base,
+                    0,
+                    windows_sys::Win32::System::Memory::MEM_RELEASE,
+                ),
+                0
+            );
         }
     }
 }

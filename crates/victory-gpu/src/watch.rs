@@ -890,6 +890,10 @@ pub fn title_memory_reading_range(range: Range<usize>) -> Reading {
         .pin(range)
 }
 
+pub(crate) fn is_changing() -> bool {
+    MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing.is_some()
+}
+
 /// Pins a range immediately if available, for callers with a fallback.
 pub(crate) fn title_memory_reading_now(range: Range<usize>) -> Option<Reading> {
     let mut state = match MAPPING.try_lock() {
