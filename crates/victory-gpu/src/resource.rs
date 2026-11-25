@@ -1369,13 +1369,32 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+fn default_room_percent(low_vram: bool) -> u64 {
+    if low_vram { 88 } else { 90 }
+}
+
+fn texture_room_available(
+    budget: u64,
+    used: u64,
+    percent: u64,
+    card_remaining: u64,
+) -> bool {
+    let ceiling = budget / 100 * percent;
+    // Cap reservation at 20% of the DXGI budget so bindless textures keep
+    // ample headroom even if VICTORY_CARD_BUFFERS_MB is configured high.
+    let reserved = card_remaining.min(budget / 5);
+    used < ceiling.saturating_sub(reserved)
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// by this process is under [`room_percent`] of the budget minus unspent
+/// `VICTORY_CARD_BUFFERS_MB` headroom (`VICTORY_TEXTURE_BUDGET_MB` sets a
+/// limit on those copies' bytes instead). Reserving unspent card-buffer VRAM
+/// keeps loading-screen textures from starving world GPU buffers into PCIe
+/// shared memory. Past the budget the system moves the card's memory into
+/// the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1394,28 +1413,27 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) => texture_room_available(
+            budget,
+            used,
+            room_percent(),
+            crate::shadow::card_budget_remaining(),
+        ),
         None => filled < WITHOUT_BUDGET,
     }
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 94 on <= 8 GiB VRAM GPUs
-/// and 90 on larger GPUs, unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): 88 on <= 8 GiB VRAM GPUs
+/// (preserving headroom for render targets, depth twins, and WDDM alongside
+/// the reserved card-buffer budget) and 90 on larger GPUs, unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        let default_percent = if crate::host::host().is_some_and(crate::host::Host::is_low_vram) {
-            94
-        } else {
-            90
-        };
+        let default_percent =
+            default_room_percent(crate::host::host().is_some_and(crate::host::Host::is_low_vram));
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -4248,5 +4266,27 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn texture_room_reserves_unspent_card_buffer_budget() {
+        assert_eq!(super::default_room_percent(true), 88);
+        assert_eq!(super::default_room_percent(false), 90);
+
+        let budget = 6881u64 << 20;
+        // Startup allocated 174 MiB of a 768 MiB card-buffer budget -> 594 MiB remaining.
+        // 88% of 6881 MiB ~= 6055 MiB, minus 594 MiB reserved ~= 5461 MiB texture limit.
+        let card_remaining = 594u64 << 20;
+        assert!(super::texture_room_available(budget, 5400u64 << 20, 88, card_remaining));
+        assert!(!super::texture_room_available(budget, 5500u64 << 20, 88, card_remaining));
+
+        // Once world buffers claim the remaining budget, textures can fill up to 88%.
+        assert!(super::texture_room_available(budget, 6000u64 << 20, 88, 0));
+        assert!(!super::texture_room_available(budget, 6056u64 << 20, 88, 0));
+
+        // Reservation is capped at 20% of total DXGI budget so textures retain >= 68%.
+        let oversized_card_cap = 4000u64 << 20;
+        assert!(super::texture_room_available(budget, 4600u64 << 20, 88, oversized_card_cap));
+        assert!(!super::texture_room_available(budget, 4700u64 << 20, 88, oversized_card_cap));
     }
 }

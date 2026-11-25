@@ -139,10 +139,26 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+const LOW_VRAM_CARD_BUFFERS_MB: u64 = 768;
+const HIGH_VRAM_CARD_BUFFERS_MB: u64 = 1024;
+const CARD_VRAM_CEILING_PERCENT: u64 = 92;
+
+fn default_card_buffers_mb(low_vram: bool) -> u64 {
+    if low_vram {
+        LOW_VRAM_CARD_BUFFERS_MB
+    } else {
+        HIGH_VRAM_CARD_BUFFERS_MB
+    }
+}
+
+fn card_fits_vram(budget: u64, used: u64, size: u64) -> bool {
+    used.saturating_add(size) <= budget / 100 * CARD_VRAM_CEILING_PERCENT
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (512 on
+/// most bytes of such copies (their "before" hashes hold 1/64th of their bytes,
+/// ~12 MiB for 768 MiB), both in bytes:
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (768 on
 /// <= 8 GiB VRAM GPUs, 1024 otherwise).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
@@ -152,20 +168,28 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        let default_cap_mb = if host().is_some_and(crate::host::Host::is_low_vram) {
-            512
-        } else {
-            1024
-        };
-        // From 1 MiB up and 1,024 MB in all by default (512 MB on <= 8 GiB VRAM
-        // GPUs): the shader writes of the smaller buffers are then found by
-        // the card's hashes too, and with that the first room's walls were
-        // drawn in every run.
+        let default_cap_mb = default_card_buffers_mb(host().is_some_and(crate::host::Host::is_low_vram));
+        // From 1 MiB up and 1,024 MB in all by default (768 MB on <= 8 GiB VRAM
+        // GPUs): fits all ~492 MiB of >= 16 MiB world buffers plus hot 1-16 MiB
+        // shader-written buffers so card hashes catch them and textures cannot
+        // push them back to PCIe L0 RAM.
         (
             mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
             mb("VICTORY_CARD_BUFFERS_MB", default_cap_mb),
         )
     })
+}
+
+/// Remaining bytes of the card-buffer VRAM budget (`VICTORY_CARD_BUFFERS_MB`)
+/// not yet allocated. `resource::room` reserves this from bindless texture
+/// uploads so loading-screen textures cannot starve world GPU buffers out of
+/// VRAM on 8 GiB cards.
+pub(crate) fn card_budget_remaining() -> u64 {
+    if !cards() || host().is_none() {
+        return 0;
+    }
+    let (_, most) = card_limits();
+    most.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -214,14 +238,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Only while the card has room under `CARD_VRAM_CEILING_PERCENT` (92%):
+    // `resource::room` reserves `card_budget_remaining()` below its texture
+    // ceiling (88% on <= 8 GiB GPUs, 90% otherwise), so world buffers allocated
+    // after loading-screen textures still fit on the card while keeping 8%
+    // headroom for WDDM and render targets.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && !card_fits_vram(budget, used, size)
     {
         return None;
     }
@@ -3453,6 +3476,23 @@ mod window_tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn card_vram_defaults_and_ceiling() {
+        assert_eq!(super::default_card_buffers_mb(true), 768);
+        assert_eq!(super::default_card_buffers_mb(false), 1024);
+
+        let budget = 6881u64 << 20;
+        // Loading-screen textures + startup heap sitting around ~80% still leave
+        // room for the 318 MiB world buffer burst below the 92% card ceiling.
+        let used_at_load = 5461u64 << 20;
+        let world_burst = 318u64 << 20;
+        assert!(super::card_fits_vram(budget, used_at_load, world_burst));
+
+        // Exceeding 92% is rejected to preserve WDDM/render-target headroom.
+        assert!(!super::card_fits_vram(budget, 6100u64 << 20, world_burst));
+        assert!(!super::card_fits_vram(0, 0, 1));
     }
 }
 
